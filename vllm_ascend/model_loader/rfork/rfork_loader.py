@@ -47,7 +47,7 @@ from vllm_ascend.model_loader.rfork.identity import (
     _resolve_sharded_dp_rank,
     build_compatibility_fingerprint,
 )
-from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
+from vllm_ascend.model_loader.rfork.safety import load_local_weights, mutable_weights_bypass_reason
 from vllm_ascend.model_loader.rfork.session import RForkSession
 from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
@@ -638,6 +638,11 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
                 )
+
+                # CPU tables are not part of the NPU transfer manifest. Complete
+                # their explicit local loaders before any shared-weight reuse
+                # or registration can treat this model as ready.
+                load_local_weights(model)
 
                 if exclude_blocks and session.can_reuse_shared_weights(
                     model, processed_layout_transfer, exclude_blocks

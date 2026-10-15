@@ -51,6 +51,7 @@ def runtime(monkeypatch):
     )
     types = load("types")
     config = load("config")
+    load("safety")
     load("manifest")
     load("tensor_layout")
     load("seed_client")
@@ -90,6 +91,7 @@ def tensor_runtime(monkeypatch):
         formats: dict | None = None
 
     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.safety", "safety.py")
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
     tensor_layout = _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.tensor_layout", "tensor_layout.py")
     transfer_backend = _load_module(

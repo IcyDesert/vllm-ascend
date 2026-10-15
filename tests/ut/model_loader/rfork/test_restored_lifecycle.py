@@ -5,8 +5,10 @@ import logging
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 from torch.nn import Module
 from torch.utils.hooks import RemovableHandle
 
@@ -64,7 +66,11 @@ def rfork_helpers(monkeypatch):
     package("vllm_ascend.model_loader.rfork")
 
     safety = _load_module(monkeypatch, "rfork_restored_lifecycle_safety", "safety.py")
-    install("vllm_ascend.model_loader.rfork.safety", mutable_weights_bypass_reason=safety.mutable_weights_bypass_reason)
+    install(
+        "vllm_ascend.model_loader.rfork.safety",
+        mutable_weights_bypass_reason=safety.mutable_weights_bypass_reason,
+        load_local_weights=safety.load_local_weights,
+    )
     install("vllm_ascend.model_loader.rfork.config", RForkConfig=object)
     install(
         "vllm_ascend.model_loader.rfork.identity",
@@ -206,3 +212,68 @@ def test_fallback_reset_restores_ascend_globals_and_only_removes_new_dynamo_hook
     assert baseline_hook_id in rfork_helpers.dynamo_hooks
     assert rfork_helpers.dynamo_hooks[baseline_hook_id].__self__ is baseline_owner
     assert discarded_hook_id not in rfork_helpers.dynamo_hooks
+
+
+@pytest.mark.parametrize("failure", [None, "local", "transfer", "seed_miss"])
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_local_weights_are_ready_before_registration_and_failures_fall_back(
+    rfork_helpers, monkeypatch, failure, processed_layout
+):
+    loader_module = rfork_helpers.loader
+    loader = loader_module.RForkModelLoader.__new__(loader_module.RForkModelLoader)
+    loader.load_config = SimpleNamespace(device=None)
+    events = []
+    model = Module()
+    model.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def load_local():
+        events.append("local")
+        if failure == "local":
+            raise RuntimeError("checkpoint read failed")
+        model.weight.data.fill_(7)
+
+    model.load_rfork_local_weights = load_local
+
+    def register(*args):
+        assert model.weight.item() == 7
+        events.append("register")
+        return True
+
+    session = SimpleNamespace(
+        register_destination=register,
+        acquire_seed=lambda: failure != "seed_miss",
+        transfer_from_seed=lambda *args: failure != "transfer",
+        log_transferred_model_layout=Mock(),
+        prepare_for_fallback=lambda: SimpleNamespace(can_schedule_seed=True),
+    )
+    fallback_model = Module()
+    fallback = Mock(return_value=fallback_model)
+    publish = Mock()
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
+    monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [])
+    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda *args: processed_layout)
+    monkeypatch.setattr(loader_module, "initialize_model", lambda **kwargs: model)
+    monkeypatch.setattr(loader_module, "_load_with_default_loader", fallback)
+    monkeypatch.setattr(loader_module, "_start_rfork_seed_service", publish)
+    monkeypatch.setattr(loader_module, "_snapshot_process_global_model_state", lambda *args: None)
+    monkeypatch.setattr(loader_module, "_reset_process_global_model_state", Mock())
+    monkeypatch.setattr(loader_module, "_refresh_rfork_flatquant_state", Mock())
+    monkeypatch.setattr(loader_module, "_rfork_skip_unquantized_moe_post_load_processing", lambda model: nullcontext())
+    monkeypatch.setattr(
+        loader_module,
+        "get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
+    )
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(empty_cache=lambda: None, synchronize=lambda: None), raising=False
+    )
+    model_config = SimpleNamespace(dtype=torch.float32)
+    config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"), model_config=model_config)
+
+    result = loader.load_model(vllm_config=config, model_config=model_config)
+
+    assert events == (["local"] if failure == "local" else ["local", "register"])
+    assert result is (model if failure is None else fallback_model)
+    assert fallback.call_count == (0 if failure is None else 1)
+    publish.assert_called_once()
+    assert publish.call_args.args[1] is result

@@ -106,6 +106,24 @@ When validating RFork for a quantized model:
 - A successful TP0 RFork transfer logs elapsed time, bytes, chunks, and throughput at INFO. Other TP ranks and
   per-chunk details remain at DEBUG. The fallback path logs `RFork transfer failed`.
 
+### Offloaded Engram tables
+
+When Engram CPU offload is enabled, RFork transfers the NPU weights and loads
+the host table from the receiver's local checkpoint. Both weight rows and any
+quantization scales use the existing Engram shard reader, including its
+shared-memory writer synchronization. BF16, INT8 and native MXFP8 storage keep
+their existing checkpoint formats.
+
+The receiver must have the same checkpoint revision as the seed, including the
+Engram table files and index. Host tables are loaded before destination memory
+registration; a failed read enters the default-loader fallback. A seed miss or
+transfer failure may therefore read the host table again during fallback.
+RFork does not accelerate the host-table read itself.
+
+Only explicitly loaded module-owned CPU state is exempt from the mixed-device
+guard. Other CPU parameters and buffers still disable RFork transfer. A local
+table must be fully loaded before its model can register as a seed.
+
 ### Intentional transfer contracts
 
 The following behaviors are deliberate RFork protocol choices, not missing

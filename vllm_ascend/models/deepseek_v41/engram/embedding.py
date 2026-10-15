@@ -178,6 +178,7 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         stays retryable and a half-finished release never leaves a live
         parameter pointing at memory the other buffer has already freed.
         """
+        self._loaded_checkpoint_state = ()
         aliases = {
             "_codes_uva": "weight",
             "_scales_uva": "weight_scale_inv",
@@ -207,6 +208,22 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         """
         self._checkpoint_path = model_path
         self._checkpoint_key = key
+        self._loaded_checkpoint_state = ()
+
+    def get_rfork_local_state_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Report only host table storage populated by a complete checkpoint read."""
+        if not self.cpu_offload:
+            return ()
+        tensors = tuple(tensor for tensor in (self.weight, self.weight_scale_inv) if tensor is not None)
+        state = tuple((id(tensor), tensor.data_ptr()) for tensor in tensors)
+        if state != getattr(self, "_loaded_checkpoint_state", ()):
+            return ()
+        return tensors
+
+    def load_rfork_local_weights(self) -> None:
+        """RFork transfers NPU state; host Engram tables retain their shard reader."""
+        if self.cpu_offload and not self.get_rfork_local_state_tensors():
+            self.load_checkpoint(self._checkpoint_path, self._checkpoint_key)
 
     def _weight_loader(self, param, loaded_weight) -> None:
         if param is self.weight:
@@ -218,8 +235,12 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         Shared head slices have one writer per DP x PCP group. The final CPU
         collective synchronizes writes and propagates loading failures.
         """
+        self._loaded_checkpoint_state = ()
         if self._shared_group is None:
             self._load_into_storage(model_path, key, chunk_rows)
+            self._loaded_checkpoint_state = tuple(
+                (id(tensor), tensor.data_ptr()) for tensor in (self.weight, self.weight_scale_inv) if tensor is not None
+            )
             return
         error = None
         if self._shared_group.rank_in_group == 0:
@@ -232,6 +253,9 @@ class AscendParallelEngramEmbedding(ParallelEngramEmbedding):
         failures = "; ".join(f"rank {rank}: {failure}" for rank, failure in enumerate(errors) if failure is not None)
         if failures:
             raise RuntimeError(f"Engram shared load failed: {failures}")
+        self._loaded_checkpoint_state = tuple(
+            (id(tensor), tensor.data_ptr()) for tensor in (self.weight, self.weight_scale_inv) if tensor is not None
+        )
 
     # The Ascend table is streamed out of these indexed safetensors shards.
     _INDEX_FILES = (

@@ -21,6 +21,7 @@ from vllm_ascend.model_loader.rfork.manifest import (
     numel_from_shape,
     read_npu_format,
 )
+from vllm_ascend.model_loader.rfork.safety import locally_loaded_state_tensor_ids
 
 TENSOR_LAYOUT_SAMPLE_LIMIT = 3
 
@@ -392,9 +393,13 @@ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> li
 def find_non_npu_state_tensors(model: Any) -> list[str]:
     if not isinstance(model, nn.Module):
         return []
+    local_state_ids = locally_loaded_state_tensor_ids(model)
     return [
         name
         for iterator in (model.named_parameters(), model.named_buffers())
         for name, tensor in iterator
-        if not tensor.is_meta and tensor.numel() > 0 and not is_tensor_on_transfer_device(tensor)
+        if not tensor.is_meta
+        and tensor.numel() > 0
+        and not is_tensor_on_transfer_device(tensor)
+        and id(tensor) not in local_state_ids
     ]
