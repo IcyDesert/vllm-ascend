@@ -47,6 +47,11 @@ from vllm_ascend.model_loader.rfork.identity import (
     _resolve_sharded_dp_rank,
     build_compatibility_fingerprint,
 )
+from vllm_ascend.model_loader.rfork.local_weights import (
+    load_local_weights,
+    record_loaded_local_weights,
+    release_local_weights,
+)
 from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
 from vllm_ascend.model_loader.rfork.session import RForkSession
 from vllm_ascend.model_loader.rfork.types import (
@@ -697,6 +702,10 @@ class RForkModelLoader(BaseModelLoader):
                 _prepare_rfork_model_state(model, model_config, load_config)
                 model_state_prepared = True
 
+                # Host tables are not transferred. Fill them before either
+                # registration or the draft shared-weight fast path can succeed.
+                load_local_weights(model)
+
                 if exclude_blocks and session.can_reuse_shared_weights(
                     model, processed_layout_transfer, exclude_blocks
                 ):
@@ -774,6 +783,14 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                 )
             except RFORK_FALLBACK_EXCEPTIONS as e:
+                engram_config = getattr(vllm_config, "engram_config", None)
+                if model_init_started and model is None and getattr(engram_config, "cpu_offload", False):
+                    # Construction can allocate host tables before raising. Without
+                    # a complete model, their CANN ranges cannot be closed safely.
+                    raise RuntimeError(
+                        "RFork cannot safely retry failed model construction with Engram CPU offload; "
+                        "partial host allocations may remain. Fix the initialization error and restart the worker."
+                    ) from e
                 fallback_source = "fallback"
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
 
@@ -799,6 +816,11 @@ class RForkModelLoader(BaseModelLoader):
                 )
 
             if model_init_started:
+                if model is not None:
+                    # CANN host allocations are not reclaimed by Python GC.
+                    # A failed release must stop fallback before a second model
+                    # is allocated while the old host tables remain registered.
+                    release_local_weights(model)
                 model = None
                 for _ in range(FALLBACK_MEMORY_RECLAIM_PASSES):
                     gc.collect()
@@ -813,6 +835,7 @@ class RForkModelLoader(BaseModelLoader):
                 and cleanup_result is not None
                 and cleanup_result.can_schedule_seed
             ):
+                record_loaded_local_weights(model)
                 _start_rfork_seed_service(
                     session,
                     model,
