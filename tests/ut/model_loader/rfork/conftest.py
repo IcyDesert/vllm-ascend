@@ -16,7 +16,12 @@ from .rfork_test_support import RFORK_ROOT, _load_module, _stub
 
 
 @pytest.fixture
-def runtime(monkeypatch):
+def local_weights(monkeypatch):
+    return _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.local_weights", "local_weights.py")
+
+
+@pytest.fixture
+def runtime(monkeypatch, local_weights):
     """Load the real lease/session code with external runtime dependencies stubbed."""
     prefix = "vllm_ascend.model_loader.rfork"
 
@@ -68,7 +73,7 @@ def runtime(monkeypatch):
 
 
 @pytest.fixture
-def tensor_runtime(monkeypatch):
+def tensor_runtime(monkeypatch, local_weights):
     _stub(monkeypatch, "vllm", __path__=[])
     _stub(monkeypatch, "vllm.logger", logger=logging.getLogger("rfork-tensor-safety-test"))
     _stub(monkeypatch, "vllm.utils", __path__=[])
@@ -106,7 +111,7 @@ def tensor_runtime(monkeypatch):
 
 
 @pytest.fixture
-def rfork_helpers(monkeypatch):
+def rfork_helpers(monkeypatch, local_weights):
     """Load the real RFork helpers with only their external imports stubbed."""
 
     def install(name, **attributes):
