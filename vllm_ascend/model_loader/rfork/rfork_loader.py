@@ -725,6 +725,14 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                 )
             except RFORK_FALLBACK_EXCEPTIONS as e:
+                engram_config = getattr(vllm_config, "engram_config", None)
+                if model_init_started and model is None and getattr(engram_config, "cpu_offload", False):
+                    # Construction can allocate host tables before raising. Without
+                    # a complete model, their CANN ranges cannot be closed safely.
+                    raise RuntimeError(
+                        "RFork cannot safely retry failed model construction with Engram CPU offload; "
+                        "partial host allocations may remain. Fix the initialization error and restart the worker."
+                    ) from e
                 fallback_source = "fallback"
                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
 

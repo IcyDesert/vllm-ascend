@@ -61,6 +61,11 @@ stops loading instead of allocating a second copy. RFork accelerates the NPU por
 it does not remove host-table disk I/O. Keep the local checkpoint and seed on the
 same model revision, and use a distinct model identity for different checkpoints.
 
+If model construction fails before returning a complete model with Engram CPU
+offload enabled, RFork stops instead of retrying through the default loader.
+Partially constructed host tables cannot be safely released through the model;
+fix the initialization error and restart the worker.
+
 ### Configuration Fields
 
 | Field Name | Type | Description | Allowed Values / Notes |

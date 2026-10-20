@@ -311,6 +311,9 @@ def test_host_table_is_ready_but_only_device_weight_is_registered(
         (False, "transfer_failure"),
         (False, "local_failure"),
         (False, "release_failure"),
+        (False, "init_failure"),
+        (False, "device_init_failure"),
+        (False, "unconfigured_init_failure"),
         (True, "transfer"),
         (True, "local_failure"),
     ],
@@ -318,6 +321,7 @@ def test_host_table_is_ready_but_only_device_weight_is_registered(
 def test_loader_loads_local_state_before_registration_or_shared_reuse(
     rfork_helpers, monkeypatch, processed, reuse, outcome
 ):
+    """Check load/release ordering and prevent unsafe retries after partial construction."""
     runtime = rfork_helpers.loader
     model = torch.nn.Module()
     events = []
@@ -363,20 +367,40 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
     monkeypatch.setattr(runtime, "gc", SimpleNamespace(collect=Mock(return_value=0)))
     fallback_model = torch.nn.Module()
     monkeypatch.setattr(runtime, "_load_with_default_loader", lambda *args: record("default", fallback_model))
-    monkeypatch.setattr(runtime, "initialize_model", lambda **kwargs: model)
+    initialization_error = RuntimeError("model construction failed after an earlier table allocation")
+
+    def initialize_model(**kwargs):
+        if outcome.endswith("init_failure"):
+            events.append("init_failure")
+            raise initialization_error
+        return model
+
+    monkeypatch.setattr(runtime, "initialize_model", initialize_model)
     monkeypatch.setattr(runtime, "_rfork_skip_unquantized_moe_post_load_processing", lambda *args: nullcontext())
     monkeypatch.setattr(runtime, "_start_rfork_seed_service", lambda *args, **kwargs: events.append("seed"))
     monkeypatch.setattr(
         runtime.torch, "npu", SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None), raising=False
     )
-    args = (SimpleNamespace(device_config=SimpleNamespace(device="cpu")), SimpleNamespace(dtype=torch.float32))
+    config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"))
+    if outcome != "unconfigured_init_failure":
+        config.engram_config = SimpleNamespace(cpu_offload=outcome != "device_init_failure")
+    args = (config, SimpleNamespace(dtype=torch.float32))
+    if outcome == "init_failure":
+        with pytest.raises(RuntimeError, match="cannot safely retry") as error:
+            loader.load_model(*args)
+        assert error.value.__cause__ is initialization_error
+        assert events == ["init_failure"]
+        return
     if outcome == "release_failure" and not reuse:
         with pytest.raises(RuntimeError, match="host unregister failed"):
             loader.load_model(*args)
         assert "default" not in events
         return
     result = loader.load_model(*args)
-    if outcome == "local_failure":
+    if outcome.endswith("init_failure"):
+        assert result is fallback_model
+        assert events == ["init_failure", "reset", "default", "ready", "seed"]
+    elif outcome == "local_failure":
         assert result is fallback_model
         assert events == ["local", "reset", "release", "default", "ready", "seed"]
     elif reuse:
