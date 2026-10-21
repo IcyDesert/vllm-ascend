@@ -1,0 +1,51 @@
+diff --git a/vllm_ascend/model_loader/rfork/session.py b/vllm_ascend/model_loader/rfork/session.py
+--- a/vllm_ascend/model_loader/rfork/session.py
++++ b/vllm_ascend/model_loader/rfork/session.py
+@@ -4,6 +4,8 @@
+ # you may not use this file except in compliance with the License.
+ 
+ import atexit
++import faulthandler
++import signal
+ import threading
+ import time
+ from typing import Any
+@@ -43,6 +45,8 @@
+ LEASE_RELEASE_DEGRADED_RETRY_INTERVAL_SEC = 60.0
+ LEASE_RELEASE_DEGRADED_LOG_EVERY_N = 10
+ RFORK_SEED_PORT_SLOTS_PER_RANK = 2
++# TEST ONLY: non-leader DP1/TP0 in the TP4/DP4, two-local-DP receiver.
++RFORK_TEST_SEED_MISS_RANK = 4
+ 
+ 
+ def _resolve_seed_server_port(config: RForkConfig, identity: RForkIdentity) -> int:
+@@ -103,6 +107,7 @@
+         self._lock = threading.RLock()
+         # Acquire before _lock; release responses must not wait on removal I/O.
+         self._seed_lifecycle_lock = threading.RLock()
++        self._test_seed_miss_injected = False
+         self._shutdown_in_progress = False
+         self._atexit_callback = self.shutdown
+         atexit.register(self._atexit_callback)
+@@ -148,6 +153,21 @@
+                 return False
+             if self.state is not RForkLifecycleState.REGISTERED:
+                 logger.error("RFork seed acquisition requires registered buffers; state=%s", self.state.name)
++                return False
++            # TEST ONLY: install this patch on receiver nodes, never on the seed.
++            if (
++                not self._test_seed_miss_injected
++                and not self.identity.is_draft_model
++                and self.identity.global_rank == RFORK_TEST_SEED_MISS_RANK
++                and self.identity.tp_rank == 0
++            ):
++                self._test_seed_miss_injected = True
++                faulthandler.register(signal.SIGUSR2, all_threads=True)
++                logger.warning(
++                    "[RFORK_FAULT_INJECT] model=main global_rank=%d action=seed_miss "
++                    "once=1 stack_signal=SIGUSR2",
++                    self.identity.global_rank,
++                )
+                 return False
+             acquisition_started = time.monotonic()
+             self.seed_lease = self.planner.acquire_seed()
